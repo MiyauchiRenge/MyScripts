@@ -4,9 +4,9 @@
 
 用之前建议把脚本本身看一眼，尤其是要 sudo 跑的那些。
 
-## 里面有什么
+## 有什么脚本
 
-| 文件 | 干什么 | 跑在什么上 |
+| 文件 | 作用 | 运行环境 |
 | --- | --- | --- |
 | `dsh-web-hardening.sh` | 给 DSH 的 Web 界面套一层 HTTPS + 密码，把"远程访问 DSH"这件事做安全 | Linux，Debian / RHEL 系 |
 | `Linux_dependencies` | 按依赖关系排序并批量安装 deb 包，内网外网都能用 | Linux x86-64 |
@@ -29,7 +29,7 @@ DSH（DeepSeek Harness）的 Web profile 默认只听 `127.0.0.1`。想从别的
 
 认证放在 Nginx，DSH 本体一行都不改，所以升级 DSH 不受影响。
 
-### 用
+### 使用方法
 
 ```bash
 sudo ./dsh-web-hardening.sh                  # 一键：自己判断该装还是该修
@@ -59,7 +59,7 @@ sudo ./dsh-web-hardening.sh --detach -y --password x # 后台跑，SSH 断了也
 `--uninstall` 只删它自己创建的文件（Nginx 站点、证书、htpasswd、覆盖层、引导侧车），
 nginx / nodejs / pm2 / dsh 这些包一个都不动，`~/.dsh` 也不碰。
 
-### 会自己判断状态
+### 判断状态
 
 默认模式会先检测环境再决定做什么，所以同一条命令反复跑是安全的：
 
@@ -75,7 +75,7 @@ nginx / nodejs / pm2 / dsh 这些包一个都不动，`~/.dsh` 也不碰。
 
 没装过就是全新安装，装过就是重新应用，发现半成品或者 DSH 监听在 `0.0.0.0` 就是修复。
 
-### 装之前知道这几件事
+### 使用之前知道这几件事
 
 - **会自己装东西**：缺 Node 会从官方发行包装（可指定镜像，带 SHA256 校验），缺 nginx 用系统包管理器装，缺 pm2 / dsh 用 npm 装。不想要这些行为加 `--no-install-node` / `--no-install-dsh` / `--no-install-pm2`。
 - **Linux 发行版差别是真的多**：Nginx 站点路径、证书目录（`/etc/ssl` vs `/etc/pki/tls`）、装完会不会自动启动，Debian 系和 RHEL 系都不一样。脚本都分别处理了，但这也是它最容易出问题的地方。
