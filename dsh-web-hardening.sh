@@ -2,8 +2,21 @@
 # =============================================================================
 #  dsh-web-hardening.sh — DSH Web 一键部署 + 加固
 #  One-shot installer + hardening for DeepSeek Harness (DSH) web profile
-#  Version: 3.0.0     License: MIT
+#  Version: 3.0.1     License: MIT
 # =============================================================================
+#
+#  变更记录
+#  ────────
+#  v3.0.1（修两个会让"脚本报成功、浏览器 500"的坑）
+#    1) htpasswd 权限：不再只 chown 一次就算完，而是先拿到 Nginx worker 的
+#       【真实】user/group（user 指令 + worker 进程实际身份），改完再【以该
+#       身份真的读一次】；chown 失败不再被 `|| true` 吞掉。
+#       症状：日志 open() "...htpasswd" failed (13: Permission denied) → 500。
+#    2) 凭据验证不再是假阳性：location = / 里的 `if (...) return 302` 在
+#       rewrite 阶段执行，早于 auth_basic 的 access 阶段 —— 拿 / 当探针时，
+#       错误密码同样返回 302 且没有 WWW-Authenticate，旧检查必定通过。
+#       现在改为探必定经过 access 阶段的 /_dsh_boot，并且直接按
+#       HTTP 状态码判定（401/403/500 都算失败）。
 #
 #  一条命令做到：装 Node/DSH → 设账号密码 → 浏览器打开 https://<本机IP> 直接进
 #
@@ -167,7 +180,7 @@ set -euo pipefail
 # 避免命令输出被重定向到 /dev/null 时出现"无声退出"（排查噩梦）。
 trap 'rc=$?; printf "\n\033[1;31m✗ 脚本中断：第 %s 行执行失败（退出码 %s）\n  命令：%s\033[0m\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 
 # 保存原始参数（解析会把它们 shift 掉，而 detach 重新执行时要原样传回）
 ORIG_ARGS=("$@")
@@ -709,14 +722,167 @@ prompt_credentials() {
   fi
 }
 
+# ── htpasswd 权限：必须让 Nginx worker 真的读得到 ───────────────────────────
+# 踩坑记录（v3.0.0 → v3.0.1）：
+#   Nginx 的 master 是 root，但【真正读密码文件的是 worker】，而 worker 会
+#   setuid 成配置里 user 指定的身份。文件若是 root:root 640，worker 读不到，
+#   auth_basic 在 access 阶段直接失败，浏览器只看到 500，日志里只有一行：
+#     [crit] open() "/etc/nginx/.dsh-web.htpasswd" failed (13: Permission denied)
+#   旧版把 chown 的失败用 `|| true` 吞掉，于是"脚本报 ✓、浏览器 500"。
+#   现在：先确定 worker 的真实身份，改完再【以该身份真的读一次】。
+NGINX_RUN_USER=""; NGINX_RUN_GROUP=""
+
+detect_nginx_worker() {
+  local line u g pid pu pg
+  # 1) nginx -T 会打出 include 之后的完整配置（root 运行时最权威）
+  line="$( { nginx -T 2>/dev/null || true; } \
+    | sed -n 's/^[[:space:]]*user[[:space:]]\{1,\}\([^;]*\);.*/\1/p' | head -1 )"
+  # 2) 退回主配置（非 root 跑 --check 时 nginx -T 会失败）
+  [ -n "$line" ] || line="$( sed -n 's/^[[:space:]]*user[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
+    /etc/nginx/nginx.conf 2>/dev/null | head -1 )"
+  # 指令形如：user <用户> [组];   —— 用 set -- 切词，避免手写去空白的坑
+  # shellcheck disable=SC2086
+  set -- $line
+  u="${1:-}"; g="${2:-}"
+  # 3) 最可信：worker 进程的【实际】身份（配置写了什么、实际成了什么，以它为准）
+  pid="$(ps -eo pid,args 2>/dev/null | awk '/nginx: worker process/ && !/awk/ {print $1; exit}')"
+  if [ -n "${pid:-}" ]; then
+    pu="$(ps -o user=  -p "$pid" 2>/dev/null | tr -d ' ')"
+    pg="$(ps -o group= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ -n "${pu:-}" ] && u="$pu"
+    [ -n "${pg:-}" ] && g="$pg"
+  fi
+  # 4) 没有 user 指令 = 以启动者身份（通常 root）运行
+  [ -n "${u:-}" ] || u="root"
+  [ -n "${g:-}" ] || g="$(id -gn "$u" 2>/dev/null || echo root)"
+  NGINX_RUN_USER="$u"; NGINX_RUN_GROUP="$g"
+}
+
+# 仅按权限位推断（无法切换身份时用；普通用户跑 --check 会走这里）
+htpasswd_readable_by_bits() {
+  local mode owner group d
+  mode="$(stat -c '%a' "$HTPASSWD" 2>/dev/null || true)"
+  [ -n "$mode" ] || return 1
+  owner="$(stat -c '%U' "$HTPASSWD" 2>/dev/null || true)"
+  group="$(stat -c '%G' "$HTPASSWD" 2>/dev/null || true)"
+  d="${mode: -3}"
+  [ "$owner" = "$NGINX_RUN_USER" ] && [ $(( ${d:0:1} & 4 )) -ne 0 ] && return 0
+  [ "$group" = "$NGINX_RUN_GROUP" ] && [ $(( ${d:1:1} & 4 )) -ne 0 ] && return 0
+  [ $(( ${d:2:1} & 4 )) -ne 0 ] && return 0
+  return 1
+}
+
+# 以 Nginx worker 的身份真的读一次 —— 光看权限位不够（补充组 / ACL / SELinux
+# 都可能让"看着能读"变成 Permission denied）。
+htpasswd_readable_by_worker() {
+  detect_nginx_worker
+  [ -f "$HTPASSWD" ] || return 1
+  [ "$NGINX_RUN_USER" = "root" ] && return 0
+  if [ "$(id -u)" -eq 0 ]; then
+    if have runuser; then
+      runuser -u "$NGINX_RUN_USER" -- test -r "$HTPASSWD" 2>/dev/null && return 0 || return 1
+    fi
+    if have su; then
+      su -s /bin/sh -c "test -r '$HTPASSWD'" "$NGINX_RUN_USER" 2>/dev/null && return 0 || return 1
+    fi
+    if have setpriv; then
+      setpriv --reuid "$NGINX_RUN_USER" --regid "$NGINX_RUN_GROUP" --clear-groups \
+        test -r "$HTPASSWD" 2>/dev/null && return 0 || return 1
+    fi
+    return 0   # root 但没有任何切换工具：无法判断，放行（下面 HTTP 探针会兜底）
+  fi
+  if have sudo && sudo -n -u "$NGINX_RUN_USER" test -r "$HTPASSWD" 2>/dev/null; then return 0; fi
+  htpasswd_readable_by_bits
+}
+
+# 目标：root 可写 + nginx worker 可读（640）。绝不 644/777 —— 这是认证凭据。
+fix_htpasswd_perms() {
+  detect_nginx_worker
+  local u="$NGINX_RUN_USER" g="$NGINX_RUN_GROUP"
+  [ -n "$g" ] || g="$NGINX_GROUP"
+  # SELinux 开着时，新建的点文件可能没贴上 httpd_config_t 标签
+  if have getenforce && [ "$(getenforce 2>/dev/null || echo Disabled)" = "Enforcing" ] && have restorecon; then
+    restorecon -F "$HTPASSWD" >/dev/null 2>&1 || true
+  fi
+  chmod 640 "$HTPASSWD" 2>/dev/null || true
+  chown "root:$g" "$HTPASSWD" 2>/dev/null || true
+  if htpasswd_readable_by_worker; then
+    ok "$HTPASSWD 权限：root:$g 640（nginx worker「$u」可读）"
+    return 0
+  fi
+  # 退路：直接归 worker 用户所有（仍是 640，其他用户读不到）
+  if [ "$u" != "root" ]; then
+    chown "$u:$g" "$HTPASSWD" 2>/dev/null || true
+    if htpasswd_readable_by_worker; then
+      ok "$HTPASSWD 权限：$u:$g 640（nginx worker 可读）"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+ensure_htpasswd_readable() {
+  htpasswd_readable_by_worker && return 0
+  detect_nginx_worker
+  err "Nginx worker「$NGINX_RUN_USER」读不到 $HTPASSWD —— 浏览器只会得到 500"
+  err "  （Nginx 日志特征是：open() \"$HTPASSWD\" failed (13: Permission denied)）"
+  err "  当前权限：$(stat -c '%U:%G %a' "$HTPASSWD" 2>/dev/null || echo 缺失)"
+  err "  手工修：chown root:$NGINX_RUN_GROUP $HTPASSWD && chmod 640 $HTPASSWD && systemctl reload nginx"
+  exit 1
+}
+
 write_htpasswd() {
   printf '%s:%s\n' "$AUTH_USER" "$(openssl passwd -apr1 "$AUTH_PASS")" > "$HTPASSWD"
-  chmod 640 "$HTPASSWD"
-  chown "root:$NGINX_GROUP" "$HTPASSWD" 2>/dev/null || true
+  fix_htpasswd_perms || true
+  ensure_htpasswd_readable
 }
 
 https_url_local() {
   if [ "$HTTPS_PORT" = "443" ]; then printf 'https://127.0.0.1/'; else printf 'https://127.0.0.1:%s/' "$HTTPS_PORT"; fi
+}
+
+# 探针必须选一个【一定会经过 access 阶段】的入口。
+#   location = / 里的 `if ($dsh_need_boot) { return 302 /_dsh_boot; }` 是
+#   rewrite 阶段，比 auth_basic 的 access 阶段更早 —— 拿 / 验凭据时，
+#   错误密码也照样 302 且没有 WWW-Authenticate（实测），验证等于没做。
+#   /_dsh_boot 没有 if 短路，必然过 auth_basic，才是有效探针。
+gate_probe_url() {
+  local u; u="$(https_url_local)"     # 总是以 / 结尾
+  if [ -f "$MAP_FILE" ] && grep -q 'dsh_need_boot' "$MAP_FILE" 2>/dev/null; then
+    printf '%s_dsh_boot' "$u"
+  else
+    printf '%s' "$u"
+  fi
+}
+
+# 门禁验证：无凭据必须 401 + WWW-Authenticate；正确凭据不能是 401/403/500。
+# 只按 HTTP 状态码判定 —— 旧版"WWW-Authenticate 头为 0 就算通过"在
+# 500（htpasswd 读不了）时同样是 0，属于假阳性。
+verify_gate() { # $1 = 明文密码；为空则只做无凭据验证
+  local probe code www pass_code
+  probe="$(gate_probe_url)"
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$probe" 2>/dev/null || true)"
+  www="$(curl -sk -i --max-time 6 "$probe" 2>/dev/null | grep -ci '^www-authenticate' || true)"
+  printf '   无密码  ：探针 %s → HTTP %s，WWW-Authenticate %s 个（期望 401 + 1 个）\n' \
+    "${probe#https://127.0.0.1}" "${code:-连接失败}" "${www:-0}"
+  if [ "${code:-}" != "401" ] || [ "${www:-0}" = "0" ]; then
+    [ "${code:-}" = "500" ] && err "HTTP 500：典型原因是 Nginx worker 读不到 $HTPASSWD（权限 13）"
+    die "Nginx 门禁未就绪（无凭据应为 401 + WWW-Authenticate，实际 $code）。已中止，DSH 未做任何改动。"
+  fi
+  ok "无密码被拒（401 + WWW-Authenticate）"
+
+  [ -n "${1:-}" ] || { warn "未拿到明文密码，跳过「正确密码」验证"; return 0; }
+  pass_code="$(curl -sk -o /dev/null -w '%{http_code}' -u "$AUTH_USER:$1" --max-time 6 "$probe" 2>/dev/null || true)"
+  printf '   正确密码：探针 %s → HTTP %s（期望：非 401/403/500）\n' \
+    "${probe#https://127.0.0.1}" "${pass_code:-连接失败}"
+  case "${pass_code:-}" in
+    401|403) die "正确密码仍被拒（HTTP $pass_code）—— htpasswd 里的用户/密码与本次设置不一致。已中止。" ;;
+    500)     die "HTTP 500 —— Nginx worker 读不到 $HTPASSWD（日志：Permission denied）。已中止。" ;;
+    200|201|204|301|302|303|307|308) ok "凭据可用（HTTP $pass_code，已穿过 Nginx）" ;;
+    502|503|504) ok "凭据可用（HTTP $pass_code ＝ 认证已通过，只是上游还没就绪）" ;;
+    4??)     ok "凭据可用（HTTP $pass_code ＝ 认证已通过，4xx 来自上游 DSH 而非门禁）" ;;
+    *)       warn "凭据验证返回 HTTP ${pass_code:-连接失败}，无法确定；请用浏览器实测" ;;
+  esac
 }
 
 cred_path() {
@@ -783,10 +949,7 @@ do_credentials() {
     warn "nginx 配置检查失败，未重载；请先确认 Nginx 站点配置正常"
   fi
 
-  local pw_www
-  pw_www="$(curl -sk -i -u "$AUTH_USER:$AUTH_PASS" --max-time 6 "$(https_url_local)" 2>/dev/null | grep -ci '^www-authenticate' || true)"
-  [ "${pw_www:-1}" = "0" ] && ok "新凭据已验证可用（已穿过 Nginx）" \
-                           || warn "凭据验证未通过，请检查 Nginx 是否在运行、端口 $HTTPS_PORT 是否可用"
+  verify_gate "$AUTH_PASS"
   echo
   echo "============================================================"
   echo "  用户名 : $AUTH_USER"
@@ -1072,10 +1235,27 @@ do_check() {
   printf '   %-26s %s\n' "站点文件"     "$([ -f "$SITE_AVAIL" ] && echo "$SITE_AVAIL" || echo 缺失)"
   printf '   %-26s %s\n' "TLS 证书"     "$([ -f "$CERT" ] && echo 存在 || echo 缺失)"
   printf '   %-26s %s\n' "basic auth"   "$([ -f "$HTPASSWD" ] && echo 存在 || echo 缺失)"
+  # 这一行专门用来提前发现"浏览器 500"：worker 读不到 htpasswd 时，
+  # auth_basic 直接失败，日志只有 open() ... Permission denied。
+  local hp_perm hp_read
+  if [ -f "$HTPASSWD" ]; then
+    hp_perm="$(stat -c '%U:%G %a' "$HTPASSWD" 2>/dev/null || echo '?')"
+    if htpasswd_readable_by_worker; then hp_read="可读 ✓"; else hp_read="不可读 ✗ → 浏览器会 500"; fi
+  else hp_perm="缺失"; hp_read="-"; fi
+  detect_nginx_worker
+  printf '   %-26s %s\n' "htpasswd 权限" "$hp_perm（nginx worker「$NGINX_RUN_USER:$NGINX_RUN_GROUP」：$hp_read）"
+  # 探针同样要走 /_dsh_boot：/ 的 302 在 auth_basic 之前返回，拿 / 体检会误报
   local url; url="https://$ACCESS_HOST$([ "$HTTPS_PORT" = "443" ] && echo "" || echo ":$HTTPS_PORT")/"
+  if [ -f "$MAP_FILE" ] && grep -q 'dsh_need_boot' "$MAP_FILE" 2>/dev/null; then url="${url}_dsh_boot"; fi
   https_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$url" 2>/dev/null || true)"
   printf '   %-26s %s\n' "HTTPS 无密码"  "${https_code:-连接失败}  (期望 401)"
-  [ "${https_code:-}" = "401" ] && ok "密码门禁生效" || warn "门禁未生效，或证书/端口未就绪"
+  if [ "${https_code:-}" = "401" ]; then
+    ok "密码门禁生效"
+  elif [ "${https_code:-}" = "500" ]; then
+    err "门禁返回 500：Nginx 读不到密码文件 —— 看上面 htpasswd 权限那一行"
+  else
+    warn "门禁未生效，或证书/端口未就绪"
+  fi
 
   step "自动登录（引导侧车）"
   boot_listen="$(ss -tlnH "sport = :$BOOT_PORT" 2>/dev/null | awk '{print $4}' | head -1 || true)"
@@ -1297,11 +1477,15 @@ do_install() {
     write_htpasswd; ok "已写入你设置的密码"
   elif [ -f "$HTPASSWD" ]; then
     ok "复用已有 $HTPASSWD（密码未变更；要重置请加 --password 或 --set-credentials）"
+    # 关键：旧版本/手工改过权限的文件会在这里被修好并复验，
+    # 否则"复用"分支会把一个浏览器必然 500 的文件一路带到安装结束
+    fix_htpasswd_perms || true
   else
     AUTH_PASS="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)"
     write_htpasswd; ok "已生成随机密码（结尾会打印，请务必保存）"
   fi
   ok "$HTPASSWD（用户：$AUTH_USER，openssl apr1，无需 apache2-utils）"
+  ensure_htpasswd_readable
 
   if [ ! -f "$CERT" ]; then
     local san="" ossl_err cfg ok_cert=0 has_addext=0
@@ -1518,35 +1702,9 @@ EOF
 
   # ── 5. 验证门禁 ───────────────────────────────────────────────────────────
   step "5/9 验证门禁（必须在动 DSH 之前通过）"
-  local url code code_f www
-  url="$(https_url_local)"
-  # 注意 nginx 的执行阶段：if 里的 return 属 rewrite 阶段，早于 auth_basic 的
-  # access 阶段。所以开启自动登录时 / 会【先】返回 302 指向 /_dsh_boot，
-  # 而 /_dsh_boot 照样要求认证（已实测：无凭据访问它返回 401）。
-  # 因此这里要【跟随重定向】判断最终结果 —— 关键是"无凭据最终必须被拒"。
-  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$url" 2>/dev/null || true)"
-  code_f="$(curl -skL --max-redirs 3 -o /dev/null -w '%{http_code}' --max-time 12 "$url" 2>/dev/null || true)"
-  www="$(curl -skL --max-redirs 3 -i --max-time 12 "$url" 2>/dev/null | grep -ci '^www-authenticate' || true)"
-  printf '   无密码：直接 %s，跟随跳转后 %s，WWW-Authenticate 头 %s 个\n' "${code:-连接失败}" "${code_f:-失败}" "${www:-0}"
-  if [ "${code_f:-}" = "401" ] && [ "${www:-0}" != "0" ]; then
-    if [ "${code:-}" = "401" ]; then
-      ok "无密码被拒（401 + WWW-Authenticate）"
-    else
-      ok "无密码被拒（/ 先 302 到自动登录入口，该入口同样要求认证 → 401）"
-    fi
-  else
-    die "Nginx 门禁未就绪（直接=$code，跟随=$code_f，www-authenticate=$www）。已中止，DSH 未做任何改动。"
-  fi
-
-  if [ -n "$AUTH_PASS" ]; then
-    local pass_www
-    pass_www="$(curl -sk -i -u "$AUTH_USER:$AUTH_PASS" --max-time 6 "$url" 2>/dev/null | grep -ci '^www-authenticate' || true)"
-    printf '   正确密码 -> WWW-Authenticate 头 %s 个（期望 0）\n' "${pass_www:-0}"
-    [ "${pass_www:-0}" = "0" ] || die "密码校验未通过，已中止，DSH 未做任何改动。"
-    ok "凭据可用（已穿过 Nginx）"
-  else
-    warn "沿用已有 htpasswd，无法用明文验证；请确认你确实知道当前密码"
-  fi
+  # 只认 HTTP 状态码，并且用 /_dsh_boot 当探针：location = / 的 302 属 rewrite
+  # 阶段，会在 auth_basic（access 阶段）之前返回 —— 拿 / 验证必然是假阳性。
+  verify_gate "$AUTH_PASS"
 
   # ── 6. DSH 配置 ───────────────────────────────────────────────────────────
   step "6/9 调整 DSH 配置"
